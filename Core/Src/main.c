@@ -66,11 +66,17 @@ typedef struct { float r, psi, e, dk[3], k[3], delta_cmd, u; int16_t acc[3]; uin
 #define CAN_TELEM_ID          0x101         // 8-byte big-endian telemetry frame, layout in CAN_SendTelemetry()
 #define CAN_PERIOD_MS         50            // 20 Hz
 
-/* ---- Bench motor / propeller test ---- */
-#define MOTOR_TEST            1             // 1: motor OFF at boot, driven from COM7 keys instead of the controller; 0: normal
-#define MOTOR_TEST_MAX        0.30f         // hard duty cap in test mode
-#define MOTOR_TEST_STEP       0.10f         // '+' / '-' step
-#define MOTOR_TEST_RAMP       0.01f         // max duty increase per 5 ms tick: 0 -> 30 % in 150 ms
+/* ---- What drives the motor ---- */
+#define MOTOR_MODE            2             // 0: autopilot (the controller), 1: keyboard test, 2: follow-the-turn demo
+#define MOTOR_TEST_MAX        1.00f         // mode 1: hard duty cap. 1.00 = bare-motor test only (no propeller)!
+#define MOTOR_TEST_STEP       0.10f         // mode 1: '+' / '-' step
+#define MOTOR_TEST_RAMP       0.01f         // mode 1: max duty increase per 5 ms tick: 0 -> 30 % in 150 ms
+#define DEMO_RATE_MIN         5.0f          // mode 2: |yaw rate| [deg/s] below this = motor off (ignores hand tremor)
+#define DEMO_RATE_FULL        60.0f         // mode 2: |yaw rate| where the duty reaches DEMO_U_MAX
+#define DEMO_U_START          0.40f         // mode 2: duty at DEMO_RATE_MIN (bare motor starts at 30-40 % on 9 V)
+#define DEMO_U_MAX            0.70f         // mode 2: duty cap
+#define DEMO_TRAVEL_TICKS     100           // mode 2: soft end stop, net 5 ms ticks of running each way (100 = 0.5 s)
+#define DEMO_SIGN             (-1.0f)       // mode 2: -1 = counter-steer (turning right drives the motor REV); flip if wrong
 
 /* ---- Outer heading loop + fuzzy scheduler ---- */
 #define PSI_D                 0.0f          // heading setpoint [deg]; boot heading is 0
@@ -146,7 +152,9 @@ static const uint8_t RULE_KD[7][7] = {  // damp hardest near the setpoint while 
 static float gyro_bias_dps;
 static volatile telem_t telem;          // ISR writes it, main loop snapshots it with IRQs off
 static uint8_t can_ready;               // set once the MCP2515 passed its self-test and the loop runs
-static volatile float test_u;           // MOTOR_TEST: signed target duty from the keys; control_step ramps toward it
+static volatile float test_u;           // mode 1: signed target duty from the keys; control_step ramps toward it
+static volatile uint8_t demo_armed;     // mode 2: 'g' arms, SPACE (or an IMU failsafe) disarms; boots disarmed
+static volatile int demo_travel;        // mode 2: net 5 ms ticks driven (+/-), shown on the dashboard
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -465,7 +473,7 @@ static void can_service(void)
   CAN_SendTelemetry();
 }
 
-// MOTOR_TEST, 5 ms ISR: duty toward 0 at once (SPACE stops instantly), away from 0 by at most
+// Mode 1, 5 ms ISR: duty toward 0 at once (SPACE stops instantly), away from 0 by at most
 // MOTOR_TEST_RAMP per tick. A reversal cuts to 0 first, then ramps the other way.
 static float test_ramp(float target)
 {
@@ -480,15 +488,44 @@ static float test_ramp(float target)
   return u;
 }
 
-// MOTOR_TEST keys on COM7: + / - change the duty in 10 % steps up to the cap, f / r pick the direction,
-// SPACE stops. Polled like can_service (idle wait + __io_putchar), so a key gets in within one character time.
+// Mode 2, 5 ms ISR: drive the motor only WHILE the IMU turns. Duty grows with |yaw rate| from DEMO_U_START
+// to DEMO_U_MAX. No rudder encoder yet, so a soft end stop allows at most DEMO_TRAVEL_TICKS of net running
+// each way from the boot position (boot with the rudder centred); driving back is always allowed.
+static float demo_step(float r)
+{
+  static int travel;
+  float u = 0.0f;
+
+  if (demo_armed && fabsf(r) >= DEMO_RATE_MIN)
+  {
+    float k = clampf((fabsf(r) - DEMO_RATE_MIN) / (DEMO_RATE_FULL - DEMO_RATE_MIN), 0.0f, 1.0f);
+    u = copysignf(DEMO_U_START + k * (DEMO_U_MAX - DEMO_U_START), DEMO_SIGN * r);
+  }
+  if ((u > 0.0f && travel >= DEMO_TRAVEL_TICKS) || (u < 0.0f && travel <= -DEMO_TRAVEL_TICKS))
+    u = 0.0f;
+  travel += (u > 0.0f) - (u < 0.0f);
+  demo_travel = travel;
+  return u;
+}
+
+// COM7 keys, polled like can_service (idle wait + __io_putchar), so a key gets in within one character time.
+//   mode 1: + / - change the duty in 10 % steps up to the cap, f / r pick the direction, SPACE stops.
+//   mode 2: g arms the demo, SPACE disarms it (motor off).
 static void keys_service(void)
 {
   static int8_t dir = 1;
 
-  if (!MOTOR_TEST || !__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE))
+  if (MOTOR_MODE == 0 || !__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE))
     return;
   char c = (char)(huart2.Instance->DR & 0xFF);
+  if (MOTOR_MODE == 2)
+  {
+    if (c == 'g' || c == 'G')
+      demo_armed = 1;
+    else if (c == ' ')
+      demo_armed = 0;
+    return;
+  }
   float lvl = fabsf(test_u);
 
   if (c == ' ')
@@ -626,7 +663,8 @@ int main(void)
 
     char cv[CV_H][CV_W + 1];
     ship_render(cv, t.psi, t.delta_cmd, frame++);
-    const char *mode = t.failsafe ? "IMU FAILSAFE" : MOTOR_TEST ? "MOTOR TEST" : fuzzy_enabled ? "FUZZY ACTIVE" : "FIXED GAINS";
+    const char *mode = t.failsafe ? "IMU FAILSAFE" : MOTOR_MODE == 1 ? "MOTOR TEST" : MOTOR_MODE == 2 ? "RUDDER DEMO"
+                     : fuzzy_enabled ? "FUZZY ACTIVE" : "FIXED GAINS";
     const char *dir = t.u > 0.0f ? "FWD" : t.u < 0.0f ? "REV" : "STOP";
 
     printf("\033[H"
@@ -652,9 +690,12 @@ int main(void)
            t.delta_cmd, fabsf(t.u) * 100.0f, dir);
     printf("|  Signed Command (u)       : %+6.2f      | Drive REV %s FWD|\r\n", t.u, bar_bi(t.u, 1.0f));
     printf("+================================================================================+\r\n");
-    if (MOTOR_TEST)
+    if (MOTOR_MODE == 1)
       printf("| MOTOR TEST  target %+4.0f %% (cap %2.0f)  keys: + - 10 %%, f r dir, SPACE stop        |\r\n",
              test_u * 100.0f, MOTOR_TEST_MAX * 100.0f);
+    else if (MOTOR_MODE == 2)
+      printf("| RUDDER DEMO %-8s  yaw %+6.1f deg/s  travel %+4d/%d  keys: g arm, SPACE off|\r\n",
+             demo_armed ? "ARMED" : "DISARMED", t.r, demo_travel, DEMO_TRAVEL_TICKS);
   }
   /* USER CODE END 3 */
 }
@@ -977,7 +1018,8 @@ static void control_step(void)
   else if (++fails >= IMU_MAX_FAILS)  // keep the last r for a few bad reads, then stop rather than steer blind
   {
     motor_set(0.0f);
-    test_u = 0.0f;  // MOTOR_TEST: don't spin back up on its own when the IMU recovers
+    test_u = 0.0f;  // modes 1/2: don't spin back up on their own when the IMU recovers
+    demo_armed = 0;
     telem.u = 0.0f;
     telem.failsafe = 1;
     return;
@@ -1000,8 +1042,10 @@ static void control_step(void)
 #error "No steering angle sensor yet: read it into delta [deg] here"
 #endif
   float u = inner_step(delta_cmd, delta);
-  if (MOTOR_TEST)
+  if (MOTOR_MODE == 1)
     u = test_ramp(clampf(test_u, -MOTOR_TEST_MAX, MOTOR_TEST_MAX));  // the keys drive the motor; the controller only feeds the dashboard
+  else if (MOTOR_MODE == 2)
+    u = demo_step(r);  // follow the turn
   motor_set(u);
 
   telem = (telem_t){r, psi, e, {dk[0], dk[1], dk[2]}, {k[0], k[1], k[2]}, delta_cmd, u, {acc[0], acc[1], acc[2]}};
